@@ -91,11 +91,17 @@ protected:
   };
 
   static Handle<Value> Commit(const Arguments& args);
+  static Handle<Value> BeginTransaction(const Arguments& args);
+  static Handle<Value> CommitTransaction(const Arguments& args);
+
   static int Commit_pool(eio_req *req);
   static int Commit_done(eio_req *req);
   struct Commit_data : AsyncOp<WritableDatabase> {
-    Commit_data(Handle<Object> ob, Handle<Function> cb)
-      : AsyncOp<WritableDatabase>(ob, cb) {}
+    Commit_data(Handle<Object> ob, Handle<Function> cb, int op, bool fl=false)
+      : AsyncOp<WritableDatabase>(ob, cb), type(op), flush(fl) {}
+    enum { eCommit, eBeginTx, eCommitTx };
+    int type;
+    bool flush;
   };
 };
 
@@ -381,6 +387,8 @@ void WritableDatabase::Init(Handle<Object> target) {
 
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "add_document", AddDocument);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "commit", Commit);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "begin_transaction", BeginTransaction);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "commit_transaction", CommitTransaction);
 
   target->Set(String::NewSymbol("DB_OPEN"               ), Integer::New(Xapian::DB_OPEN               ), ReadOnly);
   target->Set(String::NewSymbol("DB_CREATE"             ), Integer::New(Xapian::DB_CREATE             ), ReadOnly);
@@ -546,7 +554,41 @@ Handle<Value> WritableDatabase::Commit(const Arguments& args) {
     return ThrowException(Exception::TypeError(String::New("arguments are (function)")));
   Commit_data* aData;
   try {
-    aData = new Commit_data(args.This(), Local<Function>::Cast(args[0]));
+    aData = new Commit_data(args.This(), Local<Function>::Cast(args[0]), Commit_data::eCommit);
+  } catch (Local<Value> ex) {
+    return ThrowException(ex);
+  }
+
+  eio_custom(Commit_pool, EIO_PRI_DEFAULT, Commit_done, aData);
+
+  return Undefined();
+}
+
+Handle<Value> WritableDatabase::BeginTransaction(const Arguments& args) {
+  HandleScope scope;
+
+  if (args.Length() < 2 || !args[0]->IsBoolean() || !args[1]->IsFunction())
+    return ThrowException(Exception::TypeError(String::New("arguments are (boolean, function)")));
+  Commit_data* aData;
+  try {
+    aData = new Commit_data(args.This(), Local<Function>::Cast(args[1]), Commit_data::eBeginTx, args[0]->BooleanValue());
+  } catch (Local<Value> ex) {
+    return ThrowException(ex);
+  }
+
+  eio_custom(Commit_pool, EIO_PRI_DEFAULT, Commit_done, aData);
+
+  return Undefined();
+}
+
+Handle<Value> WritableDatabase::CommitTransaction(const Arguments& args) {
+  HandleScope scope;
+
+  if (args.Length() < 1 || !args[0]->IsFunction())
+    return ThrowException(Exception::TypeError(String::New("arguments are (function)")));
+  Commit_data* aData;
+  try {
+    aData = new Commit_data(args.This(), Local<Function>::Cast(args[0]), Commit_data::eCommitTx);
   } catch (Local<Value> ex) {
     return ThrowException(ex);
   }
@@ -560,7 +602,11 @@ int WritableDatabase::Commit_pool(eio_req *req) {
   Commit_data* aData = (Commit_data*) req->data;
 
   try {
-    aData->object->mWdb->commit();
+    switch (aData->type) {
+    case Commit_data::eCommit:   aData->object->mWdb->commit();                        break;
+    case Commit_data::eBeginTx:  aData->object->mWdb->begin_transaction(aData->flush); break;
+    case Commit_data::eCommitTx: aData->object->mWdb->commit_transaction();            break;
+    }
   } catch (const Xapian::Error& err) {
     aData->error = new Xapian::Error(err);
   }
