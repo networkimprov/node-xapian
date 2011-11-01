@@ -82,10 +82,12 @@ protected:
   static int AddDocument_pool(eio_req *req);
   static int AddDocument_done(eio_req *req);
   struct AddDocument_data : AsyncOp<WritableDatabase> {
-    AddDocument_data(Handle<Object> ob, Handle<Function> cb, Xapian::Document& doc)
-      : AsyncOp<WritableDatabase>(ob, cb), document(doc) {}
+    AddDocument_data(Handle<Object> ob, Handle<Function> cb, Xapian::Document& doc, String::Utf8Value* id)
+      : AsyncOp<WritableDatabase>(ob, cb), document(doc), idterm(id) {}
+    ~AddDocument_data() { if (idterm) delete idterm; }
     Xapian::Document document;
     Xapian::docid docid;
+    String::Utf8Value* idterm;
   };
 
   static Handle<Value> Commit(const Arguments& args);
@@ -426,25 +428,72 @@ Handle<Value> WritableDatabase::AddDocument(const Arguments& args) {
   Local<String> aKey;
   Local<Value> aVal;
   Xapian::Document aDoc;
-  if (aO->Has(aKey = String::New("data"))) {
-    aVal = aO->Get(aKey);
-    if (!aVal->IsString())
+  String::Utf8Value* aIdTerm = NULL;
+  try {
+    if (aO->Has(aKey = String::New("id_term"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsString())
+        return ThrowException(aErr);
+      aIdTerm = new String::Utf8Value(aVal);
+      aDoc.add_boolean_term(**aIdTerm);
+    }
+    if (aO->Has(aKey = String::New("data"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsString())
+        return ThrowException(aErr);
+      aDoc.set_data(*String::Utf8Value(aVal));
+    }
+    if (aO->Has(aKey = String::New("text"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsArray())
+        return ThrowException(aErr);
+      Local<Array> aAry = Local<Array>::Cast(aVal);
+      aTg->mTg.set_document(aDoc);
+      for (uint32_t a = 0; a < aAry->Length(); ++a) {
+        aVal = aAry->Get(a);
+        if (aVal->IsString()) {
+          aTg->mTg.index_text(*String::Utf8Value(aVal));
+          aTg->mTg.increase_termpos();
+        }
+      }
+    }
+    if (aO->Has(aKey = String::New("terms"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsObject())
+        return ThrowException(aErr);
+      Local<Object> aTerms = aVal->ToObject();
+      Local<Array> aNames = aTerms->GetPropertyNames();
+      for (uint32_t a = 0; a < aNames->Length(); ++a) {
+        aVal = aTerms->Get(aKey = aNames->Get(a)->ToString());
+        if (aVal->IsUint32())
+          aDoc.add_term(*String::Utf8Value(aKey), aVal->Uint32Value());
+      }
+    }
+    if (aO->Has(aKey = String::New("values"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsObject())
+        return ThrowException(aErr);
+      Local<Object> aValues = aVal->ToObject();
+      Local<Array> aNames = aValues->GetPropertyNames();
+      for (uint32_t a = 0; a < aNames->Length(); ++a) {
+        aVal = aNames->Get(a);
+        if (aVal->IsUint32()) {
+          uint32_t aSlot = aVal->Uint32Value();
+          aVal = aValues->Get(aSlot);
+          if (aVal->IsString())
+            aDoc.add_value(aSlot, *String::Utf8Value(aVal));
+        }
+      }
+    }
+    if (aVal.IsEmpty())
       return ThrowException(aErr);
-    aDoc.set_data(*String::Utf8Value(aVal));
+  } catch (const Xapian::Error& err) {
+    return ThrowException(Exception::Error(String::New(err.get_msg().c_str())));
   }
-  if (aO->Has(aKey = String::New("text"))) {
-    aVal = aO->Get(aKey);
-    if (!aVal->IsString())
-      return ThrowException(aErr);
-    aTg->mTg.set_document(aDoc);
-    aTg->mTg.index_text(*String::Utf8Value(aVal));
-  }
-  if (aVal.IsEmpty())
-    return ThrowException(aErr);
 
   AddDocument_data* aData;
   try {
-    aData = new AddDocument_data(args.This(), Local<Function>::Cast(args[2]), aDoc);
+    aData = new AddDocument_data(args.This(), Local<Function>::Cast(args[2]), aDoc, aIdTerm);
   } catch (Local<Value> ex) {
     return ThrowException(ex);
   }
@@ -458,7 +507,10 @@ int WritableDatabase::AddDocument_pool(eio_req *req) {
   AddDocument_data* aData = (AddDocument_data*) req->data;
 
   try {
-    aData->docid = aData->object->mWdb->add_document(aData->document);
+    if (aData->idterm)
+      aData->docid = aData->object->mWdb->replace_document(**aData->idterm, aData->document);
+    else
+      aData->docid = aData->object->mWdb->add_document(aData->document);
   } catch (const Xapian::Error& err) {
     aData->error = new Xapian::Error(err);
   }
