@@ -1,12 +1,13 @@
 var xapian = require('./xapian-binding');
 
 var aDocs = [
-  {data:'doc one', text:'text one two three four five six'},
-  {data:'item new', text:'text four five six seven eight nine'},
-  {data:'more here', text:'text alpha beta gamma delta'},
-  {data:'then some', text:'text gulf alpha charlie'},
-  {data:'and two', text:'text gulf stream waters'},
-  {data:'something more', text:'text six ten eleven twelve'}
+  {data:'doc one',   text:['text one two three four five six'],    terms:{max:1},         values:{1:'stuff'}, id_term:'#dk83ndj'},
+  {data:'doc one',   text:['text one two three four five six'],    terms:{max:1},         values:{1:'stuff'}, id_term:'#dk83ndj'},
+  {data:'item new',  text:['text four five six seven eight nine'], terms:{min:2},         values:{0:'thing'}},
+  {data:'more here', text:['text alpha beta gamma delta'],         terms:{min:1, max:2},  values:{3:'hello'}},
+  {data:'then some', text:['text gulf alpha charlie'],             terms:{max:1},         values:{1:'hi', 2:'you'}},
+  {data:'and two',   text:['text gulf stream waters'],             terms:{min:1},         values:{4:'a', 5:'b'}},
+  {data:'something', text:['text six ten eleven twelve'],          terms:{max:1},         values:{0:'what'}}
 ];
 
 
@@ -22,27 +23,30 @@ function makeDb(path) {
     console.log('opened WritableDatabase');
     atg.set_database(wdb);
     atg.set_flags(xapian.TermGenerator.FLAG_SPELLING);
-    fAdd(0);
-    function fAdd(n) {
-      if (n < aDocs.length) {
-        wdb.add_document(atg, aDocs[n], function(err) {
-          if (err) throw err;
-          console.log('added "'+aDocs[n].data+'"');
-          fAdd(++n);
-        });
-        return;
-      }
-      wdb.commit(function(err) {
-        if (err) throw err;
-        console.log('committed '+path);
-        if (path === 'db1')
-          makeDb('db2');
-        else {
-          wdb = null;
-          fRead();
+    wdb.begin_transaction(true, function(err) {
+      if (err) throw err;
+      fAdd(0);
+      function fAdd(n) {
+        if (n < aDocs.length) {
+          wdb.add_document(atg, aDocs[n], function(err) {
+            if (err) throw err;
+            console.log('added "'+aDocs[n].data+'"');
+            fAdd(++n);
+          });
+          return;
         }
-      });
-    }
+        wdb.commit_transaction(function(err) {
+          if (err) throw err;
+          console.log('committed '+path);
+          if (path === 'db1')
+            makeDb('db2');
+          else {
+            wdb = null;
+            fRead();
+          }
+        });
+      }
+    });
   });
 }
 
@@ -57,7 +61,7 @@ function fRead() {
       if (err) throw err;
       databases.add_database(db2);
       var enquire = new xapian.Enquire(databases); // assumes no i/o
-      var query = new xapian.Query(xapian.Query.OP_OR, 'one', 'six');
+      var query = new xapian.Query(xapian.Query.OP_OR, 'one', 'six', 'min');
       console.log("Performing query [" + query.description + "]");
       enquire.set_query(query); // assumes no i/o
 

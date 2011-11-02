@@ -10,7 +10,6 @@ Test on Node v0.6
 
 Rename WritableDatabaese::add_document
 Integrate mime-file converter from omindex
-Support more fields in add_document parameters object
 
-Surface begin_transaction/commit_transaction
+Support more Query constructor variants
 
