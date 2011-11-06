@@ -28,10 +28,13 @@ function makeDb(path) {
       fAdd(0);
       function fAdd(n) {
         if (n < aDocs.length) {
-          wdb.add_document(atg, aDocs[n], function(err) {
+          xapian.assemble_document(atg, aDocs[n], function(err, doc) {
             if (err) throw err;
-            console.log('added "'+aDocs[n].data+'"');
-            fAdd(++n);
+            wdb.replace_document(aDocs[n].id_term||'', doc, function(err) {
+              if (err) throw err;
+              console.log('added "'+aDocs[n].data+'"');
+              fAdd(++n);
+            });
           });
           return;
         }

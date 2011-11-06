@@ -9,15 +9,35 @@
 using namespace v8;
 using namespace node;
 
+static Persistent<String> kBusyMsg;
 
-template <class T>
-struct AsyncOp {
-  AsyncOp(Handle<Object> ob, Handle<Function> cb);
-  virtual ~AsyncOp();
-  void poolDone() { object->mBusy = false; }
-  T* object;
+struct AsyncOpBase {
+  AsyncOpBase(Handle<Function> cb)
+    : callback(), error(NULL) {
+    callback = Persistent<Function>::New(cb);
+    ev_ref(EV_DEFAULT_UC);
+  }
+  virtual ~AsyncOpBase() {
+    if (error) delete error;
+    ev_unref(EV_DEFAULT_UC);
+    callback.Dispose();
+  }
   Persistent<Function> callback;
   Xapian::Error* error;
+};
+
+template <class T>
+struct AsyncOp : public AsyncOpBase {
+  AsyncOp(Handle<Object> ob, Handle<Function> cb)
+    : AsyncOpBase(cb), object(ObjectWrap::Unwrap<T>(ob)) {
+    if (object->mBusy)
+      throw Exception::Error(kBusyMsg);
+    object->mBusy = true;
+    object->Ref();
+  }
+  virtual ~AsyncOp() { object->Unref(); }
+  void poolDone() { object->mBusy = false; }
+  T* object;
 };
 
 class Database : public EventEmitter {
@@ -78,16 +98,15 @@ protected:
 
   static Handle<Value> New(const Arguments& args);
 
-  static Handle<Value> AddDocument(const Arguments& args);
+  static Handle<Value> ReplaceDocument(const Arguments& args);
   static int AddDocument_pool(eio_req *req);
   static int AddDocument_done(eio_req *req);
   struct AddDocument_data : AsyncOp<WritableDatabase> {
-    AddDocument_data(Handle<Object> ob, Handle<Function> cb, Xapian::Document& doc, String::Utf8Value* id)
+    AddDocument_data(Handle<Object> ob, Handle<Function> cb, const Xapian::Document& doc, Handle<String> id)
       : AsyncOp<WritableDatabase>(ob, cb), document(doc), idterm(id) {}
-    ~AddDocument_data() { if (idterm) delete idterm; }
-    Xapian::Document document;
+    const Xapian::Document& document;
     Xapian::docid docid;
-    String::Utf8Value* idterm;
+    String::Utf8Value idterm;
   };
 
   static Handle<Value> Commit(const Arguments& args);
@@ -236,11 +255,19 @@ protected:
   };
 };
 
-static Persistent<String> kBusyMsg;
+static Handle<Value> AssembleDocument(const Arguments& args);
+static int Main_pool(eio_req *req);
+static int Main_done(eio_req *req);
+struct Main_data : public AsyncOpBase {
+  Main_data(Handle<Function> cb, Xapian::Document* doc)
+    : AsyncOpBase(cb), document(doc) {}
+  Xapian::Document* document;
+};
 
 extern "C"
 void init (Handle<Object> target) {
   HandleScope scope;
+  target->Set(String::NewSymbol("assemble_document"), FunctionTemplate::New(AssembleDocument)->GetFunction());
   kBusyMsg = Persistent<String>::New(String::New("object busy with async op"));
   Database::Init(target);
   WritableDatabase::Init(target);
@@ -249,25 +276,6 @@ void init (Handle<Object> target) {
   Enquire::Init(target);
   Query::Init(target);
   Document::Init(target);
-}
-
-template <class T>
-AsyncOp<T>::AsyncOp(Handle<Object> ob, Handle<Function> cb)
-  : object(ObjectWrap::Unwrap<T>(ob)), callback(), error(NULL) {
-  if (object->mBusy)
-    throw Exception::Error(kBusyMsg);
-  object->mBusy = true;
-  callback = Persistent<Function>::New(cb);
-  object->Ref();
-  ev_ref(EV_DEFAULT_UC);
-}
-
-template <class T>
-AsyncOp<T>::~AsyncOp() {
-  if (error) delete error;
-  ev_unref(EV_DEFAULT_UC);
-  object->Unref();
-  callback.Dispose();
 }
 
 static void tryCallCatch(Handle<Function> fn, Handle<Object> context, int argc, Handle<Value>* argv) {
@@ -385,7 +393,7 @@ void WritableDatabase::Init(Handle<Object> target) {
   constructor_template->InstanceTemplate()->SetInternalFieldCount(1);
   constructor_template->SetClassName(String::NewSymbol("WritableDatabase"));
 
-  NODE_SET_PROTOTYPE_METHOD(constructor_template, "add_document", AddDocument);
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "replace_document", ReplaceDocument);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "commit", Commit);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "begin_transaction", BeginTransaction);
   NODE_SET_PROTOTYPE_METHOD(constructor_template, "commit_transaction", CommitTransaction);
@@ -412,96 +420,16 @@ Handle<Value> WritableDatabase::New(const Arguments& args) {
   return args.This();
 }
 
-/*
-document input object: {
-  // all members optional; at least one required
-  id_term: string, // boolean term; if found in index, replace/delete that document
-  data: string, // pass to Document::set_data()
-  text: [ string/buffer, ... ], // pass to TermGenerator::index_text()
-  file: { path: string, mime_t: string, ... }, // invoke format converter library, then index_text()
-  terms: { term: wdfinc, ... }, // pass to Document::add_term()
-  values: { slot: value, ... } // pass to Document::add_value()
-}
-*/
-
-Handle<Value> WritableDatabase::AddDocument(const Arguments& args) {
+Handle<Value> WritableDatabase::ReplaceDocument(const Arguments& args) {
   HandleScope scope;
 
-  TermGenerator* aTg;
-  if (args.Length() < 3 || !(aTg = GetInstance<TermGenerator>(args[0])) || !args[1]->IsObject() || !args[2]->IsFunction())
-    return ThrowException(Exception::TypeError(String::New("arguments are (Document, function)")));
-
-  Local<Object> aO = args[1]->ToObject();
-  Local<Value> aErr = Exception::TypeError(String::New("incorrect document object input"));
-  Local<String> aKey;
-  Local<Value> aVal;
-  Xapian::Document aDoc;
-  String::Utf8Value* aIdTerm = NULL;
-  try {
-    if (aO->Has(aKey = String::New("id_term"))) {
-      aVal = aO->Get(aKey);
-      if (!aVal->IsString())
-        return ThrowException(aErr);
-      aIdTerm = new String::Utf8Value(aVal);
-      aDoc.add_boolean_term(**aIdTerm);
-    }
-    if (aO->Has(aKey = String::New("data"))) {
-      aVal = aO->Get(aKey);
-      if (!aVal->IsString())
-        return ThrowException(aErr);
-      aDoc.set_data(*String::Utf8Value(aVal));
-    }
-    if (aO->Has(aKey = String::New("text"))) {
-      aVal = aO->Get(aKey);
-      if (!aVal->IsArray())
-        return ThrowException(aErr);
-      Local<Array> aAry = Local<Array>::Cast(aVal);
-      aTg->mTg.set_document(aDoc);
-      for (uint32_t a = 0; a < aAry->Length(); ++a) {
-        aVal = aAry->Get(a);
-        if (aVal->IsString()) {
-          aTg->mTg.index_text(*String::Utf8Value(aVal));
-          aTg->mTg.increase_termpos();
-        }
-      }
-    }
-    if (aO->Has(aKey = String::New("terms"))) {
-      aVal = aO->Get(aKey);
-      if (!aVal->IsObject())
-        return ThrowException(aErr);
-      Local<Object> aTerms = aVal->ToObject();
-      Local<Array> aNames = aTerms->GetPropertyNames();
-      for (uint32_t a = 0; a < aNames->Length(); ++a) {
-        aVal = aTerms->Get(aKey = aNames->Get(a)->ToString());
-        if (aVal->IsUint32())
-          aDoc.add_term(*String::Utf8Value(aKey), aVal->Uint32Value());
-      }
-    }
-    if (aO->Has(aKey = String::New("values"))) {
-      aVal = aO->Get(aKey);
-      if (!aVal->IsObject())
-        return ThrowException(aErr);
-      Local<Object> aValues = aVal->ToObject();
-      Local<Array> aNames = aValues->GetPropertyNames();
-      for (uint32_t a = 0; a < aNames->Length(); ++a) {
-        aVal = aNames->Get(a);
-        if (aVal->IsUint32()) {
-          uint32_t aSlot = aVal->Uint32Value();
-          aVal = aValues->Get(aSlot);
-          if (aVal->IsString())
-            aDoc.add_value(aSlot, *String::Utf8Value(aVal));
-        }
-      }
-    }
-    if (aVal.IsEmpty())
-      return ThrowException(aErr);
-  } catch (const Xapian::Error& err) {
-    return ThrowException(Exception::Error(String::New(err.get_msg().c_str())));
-  }
+  Document* aDoc;
+  if (args.Length() < 3 || !args[0]->IsString() || !(aDoc = GetInstance<Document>(args[1])) || !args[2]->IsFunction())
+    return ThrowException(Exception::TypeError(String::New("arguments are (string, Document, function)")));
 
   AddDocument_data* aData;
   try {
-    aData = new AddDocument_data(args.This(), Local<Function>::Cast(args[2]), aDoc, aIdTerm);
+    aData = new AddDocument_data(args.This(), Local<Function>::Cast(args[2]), *aDoc->getDoc(), args[0]->ToString());
   } catch (Local<Value> ex) {
     return ThrowException(ex);
   }
@@ -515,8 +443,8 @@ int WritableDatabase::AddDocument_pool(eio_req *req) {
   AddDocument_data* aData = (AddDocument_data*) req->data;
 
   try {
-    if (aData->idterm)
-      aData->docid = aData->object->mWdb->replace_document(**aData->idterm, aData->document);
+    if (aData->idterm.length())
+      aData->docid = aData->object->mWdb->replace_document(*aData->idterm, aData->document);
     else
       aData->docid = aData->object->mWdb->add_document(aData->document);
   } catch (const Xapian::Error& err) {
@@ -963,6 +891,133 @@ int Document::GetData_done(eio_req *req) {
   }
 
   tryCallCatch(aData->callback, aData->object->handle_, aData->error ? 1 : 2, argv);
+
+  delete aData;
+
+  return 0;
+}
+
+
+/*
+document input object: {
+  // all members optional; at least one required
+  id_term: string, // boolean term; if found in index, replace/delete that document
+  data: string, // pass to Document::set_data()
+  text: [ string/buffer, ... ], // pass to TermGenerator::index_text()
+  file: { path: string, mime_t: string, ... }, // invoke format converter library, then index_text()
+  terms: { term: wdfinc, ... }, // pass to Document::add_term()
+  values: { slot: value, ... } // pass to Document::add_value()
+}
+*/
+
+static Handle<Value> AssembleDocument(const Arguments& args) {
+  HandleScope scope;
+
+  TermGenerator* aTg;
+  if (args.Length() < 3 || !(aTg = GetInstance<TermGenerator>(args[0])) || !args[1]->IsObject() || !args[2]->IsFunction())
+    return ThrowException(Exception::TypeError(String::New("arguments are (TermGenerator, object, function)")));
+
+  Local<Object> aO = args[1]->ToObject();
+  Local<Value> aErr = Exception::TypeError(String::New("incorrect document object input"));
+  Local<String> aKey;
+  Local<Value> aVal;
+  Xapian::Document aDoc;
+  try {
+    if (aO->Has(aKey = String::New("id_term"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsString())
+        return ThrowException(aErr);
+      aDoc.add_boolean_term(*String::Utf8Value(aVal));
+    }
+    if (aO->Has(aKey = String::New("data"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsString())
+        return ThrowException(aErr);
+      aDoc.set_data(*String::Utf8Value(aVal));
+    }
+    if (aO->Has(aKey = String::New("text"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsArray())
+        return ThrowException(aErr);
+      Local<Array> aAry = Local<Array>::Cast(aVal);
+      aTg->mTg.set_document(aDoc);
+      for (uint32_t a = 0; a < aAry->Length(); ++a) {
+        aVal = aAry->Get(a);
+        if (aVal->IsString()) {
+          aTg->mTg.index_text(*String::Utf8Value(aVal));
+          aTg->mTg.increase_termpos();
+        }
+      }
+    }
+    if (aO->Has(aKey = String::New("terms"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsObject())
+        return ThrowException(aErr);
+      Local<Object> aTerms = aVal->ToObject();
+      Local<Array> aNames = aTerms->GetPropertyNames();
+      for (uint32_t a = 0; a < aNames->Length(); ++a) {
+        aVal = aTerms->Get(aKey = aNames->Get(a)->ToString());
+        if (aVal->IsUint32())
+          aDoc.add_term(*String::Utf8Value(aKey), aVal->Uint32Value());
+      }
+    }
+    if (aO->Has(aKey = String::New("values"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsObject())
+        return ThrowException(aErr);
+      Local<Object> aValues = aVal->ToObject();
+      Local<Array> aNames = aValues->GetPropertyNames();
+      for (uint32_t a = 0; a < aNames->Length(); ++a) {
+        aVal = aNames->Get(a);
+        if (aVal->IsUint32()) {
+          uint32_t aSlot = aVal->Uint32Value();
+          aVal = aValues->Get(aSlot);
+          if (aVal->IsString())
+            aDoc.add_value(aSlot, *String::Utf8Value(aVal));
+        }
+      }
+    }
+    if (aVal.IsEmpty())
+      return ThrowException(aErr);
+  } catch (const Xapian::Error& err) {
+    return ThrowException(Exception::Error(String::New(err.get_msg().c_str())));
+  }
+
+  Main_data* aData = new Main_data(Local<Function>::Cast(args[2]), new Xapian::Document(aDoc));
+
+  eio_custom(Main_pool, EIO_PRI_DEFAULT, Main_done, aData);
+
+  return Undefined();
+}
+
+static int Main_pool(eio_req *req) {
+  Main_data* aData = (Main_data*) req->data;
+
+  try {
+  
+  } catch (const Xapian::Error& err) {
+    aData->error = new Xapian::Error(err);
+  }
+
+  return 0;
+}
+
+static int Main_done(eio_req *req) {
+  HandleScope scope;
+
+  Main_data* aData = (Main_data*) req->data;
+
+  Handle<Value> argv[2];
+  if (aData->error) {
+    argv[0] = Exception::Error(String::New(aData->error->get_msg().c_str()));
+    delete aData->document;
+  } else {
+    argv[0] = Null();
+    Local<Value> aDoc[] = { External::New(aData->document) };
+    argv[1] = Document::constructor_template->GetFunction()->NewInstance(1, aDoc);
+  }
+
+  tryCallCatch(aData->callback, Context::GetCurrent()->Global(), aData->error ? 1 : 2, argv);
 
   delete aData;
 
