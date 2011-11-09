@@ -63,7 +63,7 @@ public:
 protected:
     std::string shell_protect(const std::string& file);
     std::string file_to_string(const std::string& file);
-    void get_pdf_metainfo(const std::string& safefile, std::string& author, std::string& title, std::string& keywords);
+    void get_pdf_metainfo(const std::string& safefile, std::string& command, std::string& author, std::string& title, std::string& keywords);
     void parse_pdfinfo_field(const char* p, const char* end, std::string& out, const char* field, size_t len);
     void generate_sample_from_csv(const std::string& csv_data, std::string& sample);
 
