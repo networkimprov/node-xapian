@@ -302,7 +302,11 @@ struct Main_data : public AsyncOpBase {
     mime2text->Ref();
   }
   ~Main_data() {
-    if (textlist) delete [] textlist;
+    if (textlist) {
+      for (int a=0; textlist[a]; ++a)
+        delete textlist[a];
+      delete [] textlist;
+    }
     termgen->Unref();
     mime2text->Unref();
   }
