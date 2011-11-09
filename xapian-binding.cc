@@ -283,11 +283,9 @@ protected:
   static int Convert_done(eio_req *req);
   struct Convert_data : AsyncOp<Mime2Text> {
     Convert_data(Handle<Object> ob, Handle<Function> cb, Handle<String> fi, Handle<Value> ty)
-      : AsyncOp<Mime2Text>(ob, cb), filename(fi), type(ty->IsNull() ? NULL : new String::Utf8Value(ty)) {}
-    ~Convert_data() { if (type) delete type; }
+      : AsyncOp<Mime2Text>(ob, cb), filename(fi), type(ty->IsString() ? ty : Handle<Value>()) {}
     String::Utf8Value filename;
-    String::Utf8Value* type;
-    int status;
+    String::Utf8Value type;
     Xapian::Mime2Text::Fields fields;
   };
 };
@@ -999,7 +997,12 @@ int Mime2Text::Convert_pool(eio_req *req) {
   Convert_data* aData = (Convert_data*) req->data;
 
   try {
-  aData->status = aData->object->m2T.convert(*aData->filename, aData->type ? **aData->type : NULL, &aData->fields);
+  int aStatus = aData->object->m2T.convert(*aData->filename, aData->type.length() ? *aData->type : NULL, &aData->fields);
+  if (aStatus != Xapian::Mime2Text::Status_OK) {
+    std::string aMsg("Mime2Text::convert error: ");
+    aMsg += (char) (aStatus + '0');
+    throw Xapian::InternalError(aMsg);
+  }
   } catch (const Xapian::Error& err) {
     aData->error = new Xapian::Error(err);
   }
@@ -1012,12 +1015,11 @@ int Mime2Text::Convert_done(eio_req *req) {
 
   Convert_data* aData = (Convert_data*) req->data;
 
-  Handle<Value> argv[3];
+  Handle<Value> argv[2];
   if (aData->error) {
     argv[0] = Exception::Error(String::New(aData->error->get_msg().c_str()));
   } else {
     argv[0] = Null();
-    argv[1] = Integer::New(aData->status);
     Local<Object> aO(Object::New());
     aO->Set(String::NewSymbol("title"   ), String::New(aData->fields.title.c_str()));
     aO->Set(String::NewSymbol("author"  ), String::New(aData->fields.author.c_str()));
@@ -1027,10 +1029,10 @@ int Mime2Text::Convert_done(eio_req *req) {
     aO->Set(String::NewSymbol("md5"     ), String::New(aData->fields.md5.c_str()));
     aO->Set(String::NewSymbol("mimetype"), String::New(aData->fields.mimetype.c_str()));
     aO->Set(String::NewSymbol("command" ), String::New(aData->fields.command.c_str()));
-    argv[2] = aO;
+    argv[1] = aO;
   }
 
-  tryCallCatch(aData->callback, aData->object->handle_, aData->error ? 1 : 3, argv);
+  tryCallCatch(aData->callback, aData->object->handle_, aData->error ? 1 : 2, argv);
 
   delete aData;
 

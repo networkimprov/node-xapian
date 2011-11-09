@@ -84,9 +84,9 @@ function fRead() {
             return;
           }
           databases = null;
-          m2t.convert('mime-test.html', null, function(err, status, result) {
+          m2t.convert('mime-test.html', null, function(err, result) {
             if (err) throw err;
-            console.log(status+' '+result.title+' '+result.body);
+            console.log(result.title+' '+result.body);
           });
         }
       });
