@@ -1,5 +1,6 @@
 
 #include <xapian.h>
+#include "mime2text.h"
 
 #include <v8.h>
 #include <node.h>
@@ -137,6 +138,8 @@ protected:
 
   ~TermGenerator() { }
 
+  friend struct Main_data;
+
   static Handle<Value> New(const Arguments& args);
 
   static Handle<Value> SetDatabase(const Arguments& args);
@@ -255,19 +258,66 @@ protected:
   };
 };
 
+class Mime2Text : public ObjectWrap {
+public:
+  static void Init(Handle<Object> target);
+
+  static Persistent<FunctionTemplate> constructor_template;
+
+  Xapian::Mime2Text m2T;
+
+protected:
+  Mime2Text() : ObjectWrap(), m2T(), mBusy(false) {}
+
+  ~Mime2Text() { }
+
+  bool mBusy;
+
+  friend struct AsyncOp<Mime2Text>;
+  friend struct Main_data;
+
+  static Handle<Value> New(const Arguments& args);
+
+  static Handle<Value> Convert(const Arguments& args);
+  static int Convert_pool(eio_req *req);
+  static int Convert_done(eio_req *req);
+  struct Convert_data : AsyncOp<Mime2Text> {
+    Convert_data(Handle<Object> ob, Handle<Function> cb, Handle<String> fi, Handle<Value> ty)
+      : AsyncOp<Mime2Text>(ob, cb), filename(fi), type(ty->IsNull() ? NULL : new String::Utf8Value(ty)) {}
+    ~Convert_data() { if (type) delete type; }
+    String::Utf8Value filename;
+    String::Utf8Value* type;
+    int status;
+    Xapian::Mime2Text::Fields fields;
+  };
+};
+
 static Handle<Value> AssembleDocument(const Arguments& args);
 static int Main_pool(eio_req *req);
 static int Main_done(eio_req *req);
 struct Main_data : public AsyncOpBase {
-  Main_data(Handle<Function> cb, Xapian::Document* doc)
-    : AsyncOpBase(cb), document(doc) {}
+  Main_data(Handle<Function> cb, Xapian::Document* doc, TermGenerator* tg, String::Utf8Value** tl, Mime2Text* m2t, Handle<Value> p, Handle<Value> m)
+    : AsyncOpBase(cb), document(doc), termgen(tg), textlist(tl), mime2text(m2t), path(p), mimetype(m) {
+    termgen->Ref();
+    mime2text->Ref();
+  }
+  ~Main_data() {
+    if (textlist) delete [] textlist;
+    termgen->Unref();
+    mime2text->Unref();
+  }
   Xapian::Document* document;
+  TermGenerator* termgen;
+  String::Utf8Value** textlist;
+  Mime2Text* mime2text;
+  String::Utf8Value path;
+  String::Utf8Value mimetype;
+  Xapian::Mime2Text::Fields fields;
 };
 
 extern "C"
 void init (Handle<Object> target) {
   HandleScope scope;
-  target->Set(String::NewSymbol("assemble_document"), FunctionTemplate::New(AssembleDocument)->GetFunction());
   kBusyMsg = Persistent<String>::New(String::New("object busy with async op"));
   Database::Init(target);
   WritableDatabase::Init(target);
@@ -276,6 +326,8 @@ void init (Handle<Object> target) {
   Enquire::Init(target);
   Query::Init(target);
   Document::Init(target);
+  Mime2Text::Init(target);
+  target->Set(String::NewSymbol("assemble_document"), FunctionTemplate::New(AssembleDocument)->GetFunction());
 }
 
 static void tryCallCatch(Handle<Function> fn, Handle<Object> context, int argc, Handle<Value>* argv) {
@@ -897,6 +949,90 @@ int Document::GetData_done(eio_req *req) {
   return 0;
 }
 
+Persistent<FunctionTemplate> Mime2Text::constructor_template;
+
+void Mime2Text::Init(Handle<Object> target) {
+  constructor_template = Persistent<FunctionTemplate>::New(FunctionTemplate::New(New));
+  constructor_template->InstanceTemplate()->SetInternalFieldCount(1);
+  constructor_template->SetClassName(String::NewSymbol("Mime2Text"));
+
+  NODE_SET_PROTOTYPE_METHOD(constructor_template, "convert", Convert);
+
+  target->Set(String::NewSymbol("Mime2Text"), constructor_template->GetFunction());
+}
+
+Handle<Value> Mime2Text::New(const Arguments& args) {
+  HandleScope scope;
+
+  if (args.Length())
+    return ThrowException(Exception::TypeError(String::New("arguments are ()")));
+
+  Mime2Text* that = new Mime2Text();
+  that->Wrap(args.This());
+
+  return args.This();
+}
+
+Handle<Value> Mime2Text::Convert(const Arguments& args) {
+  HandleScope scope;
+
+  if (args.Length() < 3 || !args[0]->IsString() || (!args[1]->IsString() && !args[1]->IsNull()) || !args[2]->IsFunction())
+    return ThrowException(Exception::TypeError(String::New("arguments are (string, string|null, function)")));
+  Convert_data* aData;
+  try {
+    aData = new Convert_data(args.This(), Local<Function>::Cast(args[2]), args[0]->ToString(), args[1]);
+    aData->poolDone(); // concurrent access ok
+  } catch (Local<Value> ex) {
+    return ThrowException(ex);
+  }
+
+  eio_custom(Convert_pool, EIO_PRI_DEFAULT, Convert_done, aData);
+
+  return Undefined();
+}
+
+int Mime2Text::Convert_pool(eio_req *req) {
+  Convert_data* aData = (Convert_data*) req->data;
+
+  try {
+  aData->status = aData->object->m2T.convert(*aData->filename, aData->type ? **aData->type : NULL, &aData->fields);
+  } catch (const Xapian::Error& err) {
+    aData->error = new Xapian::Error(err);
+  }
+
+  return 0;
+}
+
+int Mime2Text::Convert_done(eio_req *req) {
+  HandleScope scope;
+
+  Convert_data* aData = (Convert_data*) req->data;
+
+  Handle<Value> argv[3];
+  if (aData->error) {
+    argv[0] = Exception::Error(String::New(aData->error->get_msg().c_str()));
+  } else {
+    argv[0] = Null();
+    argv[1] = Integer::New(aData->status);
+    Local<Object> aO(Object::New());
+    aO->Set(String::NewSymbol("title"   ), String::New(aData->fields.title.c_str()));
+    aO->Set(String::NewSymbol("author"  ), String::New(aData->fields.author.c_str()));
+    aO->Set(String::NewSymbol("keywords"), String::New(aData->fields.keywords.c_str()));
+    aO->Set(String::NewSymbol("sample"  ), String::New(aData->fields.sample.c_str()));
+    aO->Set(String::NewSymbol("body"    ), String::New(aData->fields.dump.c_str()));
+    aO->Set(String::NewSymbol("md5"     ), String::New(aData->fields.md5.c_str()));
+    aO->Set(String::NewSymbol("mimetype"), String::New(aData->fields.mimetype.c_str()));
+    aO->Set(String::NewSymbol("command" ), String::New(aData->fields.command.c_str()));
+    argv[2] = aO;
+  }
+
+  tryCallCatch(aData->callback, aData->object->handle_, aData->error ? 1 : 3, argv);
+
+  delete aData;
+
+  return 0;
+}
+
 
 /*
 document input object: {
@@ -914,45 +1050,47 @@ static Handle<Value> AssembleDocument(const Arguments& args) {
   HandleScope scope;
 
   TermGenerator* aTg;
-  if (args.Length() < 3 || !(aTg = GetInstance<TermGenerator>(args[0])) || !args[1]->IsObject() || !args[2]->IsFunction())
-    return ThrowException(Exception::TypeError(String::New("arguments are (TermGenerator, object, function)")));
+  Mime2Text* aM2t;
+  if (args.Length() < 4 || !(aTg = GetInstance<TermGenerator>(args[0])) || !(aM2t = GetInstance<Mime2Text>(args[1]))
+   || !args[2]->IsObject() || !args[3]->IsFunction())
+    return ThrowException(Exception::TypeError(String::New("arguments are (TermGenerator, Mime2Text, object, function)")));
 
-  Local<Object> aO = args[1]->ToObject();
-  Local<Value> aErr = Exception::TypeError(String::New("incorrect document object input"));
+  Local<Object> aO = args[2]->ToObject();
   Local<String> aKey;
-  Local<Value> aVal;
+  Local<Value> aVal, aPath, aMime;
+  String::Utf8Value** aTextList = NULL;
   Xapian::Document aDoc;
   try {
     if (aO->Has(aKey = String::New("id_term"))) {
       aVal = aO->Get(aKey);
       if (!aVal->IsString())
-        return ThrowException(aErr);
+        return ThrowException(Exception::TypeError(String::New("input object id_term not a string")));
       aDoc.add_boolean_term(*String::Utf8Value(aVal));
     }
     if (aO->Has(aKey = String::New("data"))) {
       aVal = aO->Get(aKey);
       if (!aVal->IsString())
-        return ThrowException(aErr);
+        return ThrowException(Exception::TypeError(String::New("input object data not a string")));
       aDoc.set_data(*String::Utf8Value(aVal));
     }
-    if (aO->Has(aKey = String::New("text"))) {
+    if (aO->Has(aKey = String::New("file"))) {
       aVal = aO->Get(aKey);
-      if (!aVal->IsArray())
-        return ThrowException(aErr);
-      Local<Array> aAry = Local<Array>::Cast(aVal);
-      aTg->mTg.set_document(aDoc);
-      for (uint32_t a = 0; a < aAry->Length(); ++a) {
-        aVal = aAry->Get(a);
-        if (aVal->IsString()) {
-          aTg->mTg.index_text(*String::Utf8Value(aVal));
-          aTg->mTg.increase_termpos();
-        }
+      if (!aVal->IsObject())
+        return ThrowException(Exception::TypeError(String::New("input object file not an object")));
+      Local<Object> aFile = aVal->ToObject();
+      aPath = aFile->Get(String::New("path"));
+      if (!aPath->IsString())
+        return ThrowException(Exception::TypeError(String::New("input object file.path not a string")));
+      if (aFile->Has(aKey = String::New("mime_t"))) {
+        aMime = aFile->Get(aKey);
+        if (!aMime->IsString())
+          return ThrowException(Exception::TypeError(String::New("input object file.mime_t not a string")));
       }
     }
     if (aO->Has(aKey = String::New("terms"))) {
       aVal = aO->Get(aKey);
       if (!aVal->IsObject())
-        return ThrowException(aErr);
+        return ThrowException(Exception::TypeError(String::New("input object terms not an object")));
       Local<Object> aTerms = aVal->ToObject();
       Local<Array> aNames = aTerms->GetPropertyNames();
       for (uint32_t a = 0; a < aNames->Length(); ++a) {
@@ -964,7 +1102,7 @@ static Handle<Value> AssembleDocument(const Arguments& args) {
     if (aO->Has(aKey = String::New("values"))) {
       aVal = aO->Get(aKey);
       if (!aVal->IsObject())
-        return ThrowException(aErr);
+        return ThrowException(Exception::TypeError(String::New("input object values not an object")));
       Local<Object> aValues = aVal->ToObject();
       Local<Array> aNames = aValues->GetPropertyNames();
       for (uint32_t a = 0; a < aNames->Length(); ++a) {
@@ -977,13 +1115,23 @@ static Handle<Value> AssembleDocument(const Arguments& args) {
         }
       }
     }
+    if (aO->Has(aKey = String::New("text"))) {
+      aVal = aO->Get(aKey);
+      if (!aVal->IsArray())
+        return ThrowException(Exception::TypeError(String::New("input object text not an array")));
+      Local<Array> aAry = Local<Array>::Cast(aVal);
+      aTextList = new String::Utf8Value*[aAry->Length()+1];
+      for (uint32_t a = 0; a < aAry->Length(); ++a)
+        aTextList[a] = new String::Utf8Value(aAry->Get(a));
+      aTextList[aAry->Length()] = NULL;
+    }
     if (aVal.IsEmpty())
-      return ThrowException(aErr);
+      return ThrowException(Exception::TypeError(String::New("input object has no relevant members")));
   } catch (const Xapian::Error& err) {
     return ThrowException(Exception::Error(String::New(err.get_msg().c_str())));
   }
 
-  Main_data* aData = new Main_data(Local<Function>::Cast(args[2]), new Xapian::Document(aDoc));
+  Main_data* aData = new Main_data(Local<Function>::Cast(args[3]), new Xapian::Document(aDoc), aTg, aTextList, aM2t, aPath, aMime);
 
   eio_custom(Main_pool, EIO_PRI_DEFAULT, Main_done, aData);
 
@@ -994,7 +1142,35 @@ static int Main_pool(eio_req *req) {
   Main_data* aData = (Main_data*) req->data;
 
   try {
-  
+  aData->termgen->mTg.set_document(*aData->document);
+  for (int a = 0; aData->textlist && aData->textlist[a]; ++a) {
+    aData->termgen->mTg.index_text(**aData->textlist[a]);
+    aData->termgen->mTg.increase_termpos();
+  }
+  if (aData->path.length()) {
+    int aStatus = aData->mime2text->m2T.convert(*aData->path, aData->mimetype.length() ? *aData->mimetype : NULL, &aData->fields);
+    if (aStatus != Xapian::Mime2Text::Status_OK) {
+      std::string aMsg("Mime2Text::convert error: ");
+      aMsg += (char) (aStatus + '0');
+      throw Xapian::InternalError(aMsg);
+    }
+    if (!aData->fields.title.empty()) {
+      aData->termgen->mTg.index_text(aData->fields.title);
+      aData->termgen->mTg.increase_termpos();
+    }
+    if (!aData->fields.author.empty()) {
+      aData->termgen->mTg.index_text(aData->fields.author);
+      aData->termgen->mTg.increase_termpos();
+    }
+    if (!aData->fields.keywords.empty()) {
+      aData->termgen->mTg.index_text(aData->fields.keywords);
+      aData->termgen->mTg.increase_termpos();
+    }
+    if (!aData->fields.dump.empty()) {
+      aData->termgen->mTg.index_text(aData->fields.dump);
+      aData->termgen->mTg.increase_termpos();
+    }
+  }
   } catch (const Xapian::Error& err) {
     aData->error = new Xapian::Error(err);
   }

@@ -7,10 +7,11 @@ var aDocs = [
   {data:'more here', text:['text alpha beta gamma delta'],         terms:{min:1, max:2},  values:{3:'hello'}},
   {data:'then some', text:['text gulf alpha charlie'],             terms:{max:1},         values:{1:'hi', 2:'you'}},
   {data:'and two',   text:['text gulf stream waters'],             terms:{min:1},         values:{4:'a', 5:'b'}},
-  {data:'something', text:['text six ten eleven twelve'],          terms:{max:1},         values:{0:'what'}}
+  {data:'something', text:['text six ten eleven twelve'],          terms:{max:1},         values:{0:'what'}, file:{path:'mime-test.html'}}
 ];
 
 
+var m2t = new xapian.Mime2Text;
 var atg = new xapian.TermGenerator;
 var stem = new xapian.Stem('english');
 atg.set_stemmer(stem);
@@ -28,7 +29,7 @@ function makeDb(path) {
       fAdd(0);
       function fAdd(n) {
         if (n < aDocs.length) {
-          xapian.assemble_document(atg, aDocs[n], function(err, doc) {
+          xapian.assemble_document(atg, m2t, aDocs[n], function(err, doc) {
             if (err) throw err;
             wdb.replace_document(aDocs[n].id_term||'', doc, function(err) {
               if (err) throw err;
@@ -83,7 +84,10 @@ function fRead() {
             return;
           }
           databases = null;
-          console.log('done');
+          m2t.convert('mime-test.html', null, function(err, status, result) {
+            if (err) throw err;
+            console.log(status+' '+result.title+' '+result.body);
+          });
         }
       });
     });
