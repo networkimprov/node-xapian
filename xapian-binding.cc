@@ -1150,7 +1150,7 @@ static int Main_pool(eio_req *req) {
   try {
   aData->termgen->mTg.set_document(*aData->document);
   for (int a = 0; aData->textlist && aData->textlist[a]; ++a) {
-    aData->termgen->mTg.index_text(**aData->textlist[a]);
+    aData->termgen->mTg.index_text(Xapian::Utf8Iterator(**aData->textlist[a], aData->textlist[a]->length()));
     aData->termgen->mTg.increase_termpos();
   }
   if (aData->path.length()) {
